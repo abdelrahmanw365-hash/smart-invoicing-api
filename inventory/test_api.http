@@ -1,0 +1,21 @@
+### Get all Products
+GET http://127.0.0.1:8000/api/products/
+
+### Get all Clients
+GET http://127.0.0.1:8000/api/clients/
+
+### CREATE AN INVOICE (The Magic Flow)
+POST http://127.0.0.1:8000/api/invoices/
+Content-Type: application/json
+
+{
+    "client_id": 1,
+    "tax_rate": 14.0,
+    "discount": 50.00,
+    "items": [
+        {
+            "product_id": 1,
+            "quantity": 2
+        }
+    ]
+}
