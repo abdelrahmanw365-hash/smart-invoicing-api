@@ -1,17 +1,26 @@
 from decimal import Decimal
 from django.db import transaction
 from django.core.exceptions import ValidationError
-from .models import Invoice, InvoiceItem
+from .models import Invoice, InvoiceItem, Product
 
 
 def create_invoice_flow(client, items_data, payment_method='CASH', amount_paid=0.00):
     """
-    items_data: list of dicts: [
-        {'product': product_obj, 'quantity': int, 'discount_rate': Decimal, 'vat_rate': Decimal}, ...
-    ]
+    Secure transaction-wrapped checkout flow.
+    Calculates VAT authoritatively server-side (14%).
+    Locks product records during execution to prevent race conditions.
     """
+    # Authoritative Egypt VAT Rate
+    VAT_RATE = Decimal('14.00')
+
     with transaction.atomic():
-        # 1. Create the base invoice shell
+        # 1. Lock the product database rows using select_for_update() to prevent race conditions
+        product_ids = [item['product_id'] for item in items_data]
+        locked_products = {
+            p.id: p for p in Product.objects.select_for_update().filter(id__in=product_ids)
+        }
+
+        # 2. Initialize the base invoice with temporary zero sums
         invoice = Invoice.objects.create(
             client=client,
             payment_method=payment_method,
@@ -21,40 +30,47 @@ def create_invoice_flow(client, items_data, payment_method='CASH', amount_paid=0
         running_subtotal = Decimal('0.00')
         running_total_discount = Decimal('0.00')
         running_total_vat = Decimal('0.00')
-        running_total = Decimal('0.00')
 
-        # 2. Process line items
+        # 3. Process line items under database lock
         for item in items_data:
-            product = item['product']
+            prod_id = item['product_id']
             qty = Decimal(str(item['quantity']))
             disc_rate = Decimal(str(item.get('discount_rate', 0.00)))
-            vat_rate = Decimal(str(item.get('vat_rate', 14.00)))  # Default 14% Egypt VAT
 
-            # Stock check
+            product = locked_products.get(prod_id)
+            if not product:
+                raise ValidationError(f"Product ID {prod_id} does not exist.")
+
+            # 🪄 Authoritative Stock Validation (Server-side)
             if product.stock < item['quantity']:
-                raise ValidationError(f"Not enough stock for {product.name}. Only {product.stock} left.")
+                raise ValidationError(
+                    f"Transaction aborted: Not enough stock for {product.name}. "
+                    f"Requested: {item['quantity']}, Available: {product.stock}"
+                )
 
-            # Deduct inventory
+            # Deduct inventory safely
             product.stock -= item['quantity']
             product.save()
 
-            # Calculations
+            # Dynamic price calculations (Authoritative)
             price = product.selling_price
             subtotal_line = price * qty
 
             discount_line = subtotal_line * (disc_rate / Decimal('100'))
             taxable_line = subtotal_line - discount_line
-            vat_line = taxable_line * (vat_rate / Decimal('100'))
+
+            # Force authoritative 14% VAT computation
+            vat_line = taxable_line * (VAT_RATE / Decimal('100'))
             total_line = taxable_line + vat_line
 
-            # Save line item
+            # Save line item record
             InvoiceItem.objects.create(
                 invoice=invoice,
                 product=product,
                 quantity=item['quantity'],
                 unit_price=price,
                 discount_rate=disc_rate,
-                vat_rate=vat_rate,
+                vat_rate=VAT_RATE,
                 discount_amount=discount_line,
                 vat_amount=vat_line,
                 total_price=total_line
@@ -64,10 +80,19 @@ def create_invoice_flow(client, items_data, payment_method='CASH', amount_paid=0
             running_subtotal += subtotal_line
             running_total_discount += discount_line
             running_total_vat += vat_line
-            running_total += total_line
 
-        # 3. Determine Payment Status
+        # 4. Calculate grand total
+        running_total = (running_subtotal - running_total_discount) + running_total_vat
+
+        # 🪄 Validate Payment Methods & Underpayments
         paid_amount = Decimal(str(amount_paid))
+        if payment_method == 'CASH' and paid_amount < running_total:
+            raise ValidationError(
+                f"Validation Error: Amount Paid (${paid_amount}) cannot be less than "
+                f"Total Due (${running_total}) for Cash transactions."
+            )
+
+        # Determine Payment Status
         if paid_amount >= running_total:
             status = 'PAID'
         elif paid_amount > 0:
@@ -75,7 +100,7 @@ def create_invoice_flow(client, items_data, payment_method='CASH', amount_paid=0
         else:
             status = 'UNPAID'
 
-        # 4. Finalize Invoice Details
+        # 5. Finalize invoice financial calculations
         invoice.subtotal = running_subtotal
         invoice.total_discount = running_total_discount
         invoice.total_vat = running_total_vat
